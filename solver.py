@@ -1,103 +1,148 @@
-import json
-import numpy as np
+from env import sudoku
+
+## Importing personal environment for playing Sudoku
+
+env = sudoku()
+
 import tensorflow as tf
-from tensorflow.keras import layers, models, optimizers
-import random
+import os
+import numpy as np
+import numpy.random as rnd
 
-# Load data from JSON files
-def load_data(json_file):
-    with open(json_file, 'r') as file:
-        data = json.load(file)
-    return data['data']
+## Importing Libraries
 
-# Process data into numpy arrays
-def process_data(data):
-    htmaps = []
-    images = []
+def q_network(X_state,name):## Defining a neaural network to find the q value for an observation
 
-    for testcase in data:
-        htmap = np.array(testcase['htmap'])
-        image = np.array(testcase['image'])
+    ## args:
+        ## X_state : Input the state shape of (10,10,1)
+        ## name    : Name of the network
 
-        htmaps.append(htmap)
-        images.append(image)
-
-    return np.array(htmaps), np.array(images)
-
-# Load training and testing data
-train_data = load_data('training.json')
-test_data = load_data('testing.json')
-
-# Process data
-train_htmaps, train_images = process_data(train_data)
-test_htmaps, test_images = process_data(test_data)
-
-# Expand dimensions to add a channel for the CNN input
-train_htmaps = np.expand_dims(train_htmaps, axis=-1)
-test_htmaps = np.expand_dims(test_htmaps, axis=-1)
-
-# Define the CNN architecture
-def create_cnn_model():
-    inpMap = layers.Input(shape=(10, 10, 1))
-    inpPos = layers.Input(shape=(2,))
-    x = layers.Conv2D(32, (3, 3), activation='relu', padding='same', input_shape=(10, 10, 1))(inpMap)
-    x = layers.Conv2D(64, (3, 3), activation='relu', padding='same')(x)
-    x = layers.Conv2D(64, (3, 3), activation='relu', padding='same')(x)
-    x = layers.Flatten()(x)
-    x = models.Model(inputs=inpMap, outputs=x)
-    cmb = layers.concatenate([x.output, inpPos], axis=1)
-    y = layers.Dense(128, activation='relu')(cmb)
-    y = layers.Dense(64, activation='relu')(y)
-    y = layers.Dense(1, activation='sigmoid')(y)
-    model = models.Model(inputs=[x.input, inpPos], outputs=y)
-    return model
-
-# Create the CNN model
-cnn_model = create_cnn_model()
-
-# Compile the model
-optimizer = optimizers.Adam(learning_rate=0.01)
-cnn_model.compile(optimizer=optimizer, loss='binary_crossentropy', metrics=['accuracy'])
-
-opts = [[i, j] for j in len(10) for i in len(10)]
-random.shuffle(opts)
-
-num_epochs = 50
-batch_size = 1
-
-for epoch in range(num_epochs):
-    print(f"Epoch {epoch + 1}/{num_epochs}")
+    ## output:
+        ## outputs : output layer values shape of(10**2)
+        ## trainable_vars_by_name : name of the each neauron in each layers
+  with tf.variable_scope(name) as scope:
+    conv1 = tf.layers.conv2d(X_state,filters=9,kernel_size=(9,1),activation=tf.nn.relu)
+    conv2 = tf.layers.conv2d(conv1,filters=9,kernel_size=(1,9),activation=tf.nn.relu)
+    conv3 = tf.layers.conv2d(conv2,filters=9,kernel_size=(1,1),activation=tf.nn.relu)
+    mid = tf.reshape(conv3,shape=[-1,9])
+    fc1 = tf.layers.dense(mid,9**2)
+    fc1_norm = tf.layers.batch_normalization(fc1,training=False,momentum=0.9)
+    fc1_act = tf.nn.relu(fc1_norm)
+    fc2 = tf.layers.dense(fc1_act,9**3)
+    fc2_norm = tf.layers.batch_normalization(fc2,training=False,momentum=0.9)
+    fc2_act = tf.nn.relu(fc2_norm)
+    outputs = tf.layers.dense(fc2_act,9**3)
     
-    # Shuffle the indices to randomly select rows and columns
-    indices = np.random.permutation(len(train_htmaps))
+  trainable_vars = tf.get_collection(tf.GraphKeys.TRAINABLE_VARIABLES,scope=scope.name)
+  trainable_vars_by_name =  {var.name[len(scope.name):]: var
+                            for var in trainable_vars}
+  return outputs, trainable_vars_by_name
+
+X_state = tf.placeholder(tf.float32, shape=[None,9,9,9])
+actor_q_values,actor_vars = q_network(X_state,name="q_networks/actor")
+## Actor q value to make decission
+critic_q_values,critic_vars = q_network(X_state,name="q_networks/critic")
+## Critic q value to guess actor q value and increse rewards
+copy_ops = [actor_var.assign(critic_vars[var_name])
+           for var_name, actor_var in actor_vars.items()]
+copy_critic_to_actor = tf.group(*copy_ops)
+
+X_action = tf.placeholder(tf.int32,shape=[None])
+q_value = tf.reduce_sum(critic_q_values*tf.one_hot(X_action,9**3),axis=1,keep_dims=True)
+## Finding q value of the selected action value
+
+learning_rate = 1e-2
+
+y = tf.placeholder(tf.float32,shape=[None,1])
+cost = tf.reduce_mean(tf.square(y-q_value))
+global_step = tf.Variable(0,trainable=False,name='global_step')
+optimizer = tf.train.AdamOptimizer(learning_rate)
+training_op = optimizer.minimize(cost,global_step=global_step)
+
+init = tf.global_variables_initializer()
+saver = tf.train.Saver()
+
+from collections import deque
+
+replay_memory_size = 10000
+replay_memory = deque([],maxlen=replay_memory_size)
+
+def sample_memories(batch_size):
+  indices = rnd.permutation(len(replay_memory))[:batch_size]
+  cols = [[],[],[],[],[]]
+  for idx in indices:
+    memory = replay_memory[idx]
+    for col, value in zip(cols, memory):
+      col.append(value)
+  cols = [np.array(col) for col in cols]
+  return (cols[0],cols[1],cols[2].reshape(-1,1),cols[3],cols[4].reshape(-1,1))
+
+eps_min = 0.05
+eps_max = 1.0
+eps_decay_steps = 50000
+
+def epsilon_greedy(q_values,step):
+  ## Args
+    ## q_values : get q values of each available actions
+    ## step     : get the step count
+  ## By epsilon greedy function it allows actor to go through the unchecked locations in the begining of the training
+  ## Return
+    ## Return which acton to do
+  epsilon = max(eps_min,eps_max-(eps_max-eps_min)*step/eps_decay_steps)
+  if np.random.rand()<epsilon:
+    return np.random.randint(9**3)
+  else:
+    return np.argmax(q_values)
+
+n_steps = 100000
+training_start = 1000
+training_interval = 3
+save_steps = 50
+copy_steps = 25
+discount_rate = 0.95
+skip_start = 0
+batch_size = 50
+iteration = 0
+checkpoint_path = "./my_dqn.ckpt"
+done = True
+
+with tf.Session() as sess:
+  if os.path.isfile(checkpoint_path):
+    saver.restore(sess,checkpoint_path)
+  else:
+    init.run()
+  while True:
+    step = global_step.eval()
+    if step >= n_steps:
+      break
+    iteration += 1
+    if done:
+      obs = env.reset()
+      state = obs
+    p1_q_values = actor_q_values.eval(feed_dict={X_state:[state]})
+    p1_action = epsilon_greedy(p1_q_values,step)
+    r = int(p1_action/81)       ## Get the Row to Add or Change
+    c = int((p1_action%81)/9)   ## Get the Column to Add or Change
+    n = ((p1_action%81)%9)+1    ## Get the number that is going to be in the selected box
+    action = [r,c,n]
+    print(action)
+    obs,reward,done,info = env.step(action)
+    next_state = obs
     
-    for i in indices:
-        # Randomly select row and column
-        row = np.random.randint(0, 10)
-        col = np.random.randint(0, 10)
-        
-        # Get the corresponding input and target
-        input_data = [train_htmaps[i], np.array([[row, col]])]
-        target = train_images[i, row, col]  # Assuming train_images is a binary array
-        
-        # Train on the current example
-        loss, accuracy = cnn_model.train_on_batch(input_data, np.array([target]))
-        
-        # Print training metrics
-        print(f"Batch - Loss: {loss:.4f}, Accuracy: {accuracy:.4f}")
-
-# # Train the CNN model
-# cnn_model.fit(train_htmaps, train_images, epochs=50, batch_size=1)
-
-# # Evaluate the CNN model on the test set
-# loss, accuracy = cnn_model.evaluate(test_htmaps, test_images)
-# print(f'Test Loss: {loss}, Test Accuracy: {accuracy}')
-
-# # Make predictions using the CNN model on new data
-# new_data = np.random.rand(5, 10, 10)  # Replace this with your new data
-# new_data = np.expand_dims(new_data, axis=-1)
-# cnn_predictions = cnn_model.predict(new_data)
-# cnn_predictions_binary = np.where(cnn_predictions >= 0.5, 1, 0)
-
-# print("CNN Predictions:")
-# print(cnn_predictions_binary)
+    replay_memory.append((state,p1_action,reward,next_state,1.0-done))
+    state = next_state
+    
+    if iteration <training_start or iteration % training_interval != 0:
+      continue
+      
+    X_state_val,X_action_val,rewards, X_next_state_val, continues = (sample_memories(batch_size))
+    next_q_values = actor_q_values.eval(feed_dict={X_state:X_next_state_val})
+    max_next_q_values = np.max(next_q_values,axis=1,keepdims=True)
+    y_val = rewards+continues*discount_rate*max_next_q_values
+    training_op.run(feed_dict={X_state:X_state_val,X_action:X_action_val,y:y_val})
+    
+    if step % copy_steps == 0:
+      copy_critic_to_actor.run()
+      
+    if step % save_steps == 0:
+      saver.save(sess,checkpoint_path)
